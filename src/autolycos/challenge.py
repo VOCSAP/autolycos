@@ -1,6 +1,6 @@
 """Shared anti-bot challenge heuristic (pure module, no tool imports).
 
-Hoisted so EVERY fetcher tier (http/tls/browser/uc) derives
+Hoisted so EVERY fetcher tier (http/tls/browser/uc/camoufox) derives
 FetchResult.challenged from the SAME markers. The core retry loop keys on that
 abstract signal, so it must be consistent across tiers -- a marker known to one
 tier but not another would make retry behave differently per tool.
@@ -49,3 +49,24 @@ def looks_challenged(status: int, text: str) -> bool:
     if any(marker in low for marker in CHALLENGE_MARKERS):
         return True
     return len(text) < _MIN_PLAUSIBLE_BYTES
+
+
+# Chrome's OWN "can't reach this page" interstitial (a failed navigation --
+# ERR_CONNECTION_REFUSED, DNS_PROBE_*, a timeout) is a distinct signal from
+# CHALLENGE_MARKERS above: those are content a SITE serves, this is Chrome
+# never reaching the site at all. Card 1bddf3fa: SeleniumBase UC's
+# uc_open_with_reconnect does not raise on this failure -- it silently lands
+# on the interstitial, which is large enough (~188KB) and generic enough to
+# slip past looks_challenged unnoticed. Judged by CONTENT only (never size):
+# a genuine large page and a large error page cannot be told apart by length.
+# Hoisted here (not uc.py-local) so a Chrome-based tier other than uc can
+# reuse the same predicate without duplicating it.
+_CHROME_ERROR_PAGE_MARKER = '"errorCode":"ERR_'
+
+
+def looks_like_chrome_error_page(current_url: str | None, text: str) -> bool:
+    """True if Chrome served its OWN internal error page instead of
+    anything the target actually returned."""
+    if current_url is not None and current_url.startswith("chrome-error://"):
+        return True
+    return _CHROME_ERROR_PAGE_MARKER in text

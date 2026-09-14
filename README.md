@@ -3,94 +3,124 @@
 **Fetch web pages that fight back, without your code caring how.**
 
 `autolycos` is an anti-bot fetching subsystem: it resolves access to
-bot-protected pages by escalating through increasingly capable (and costly)
-fetcher tiers, behind a single stable port, with fail-closed SSRF guards. It is
-domain-agnostic by design -- the caller injects a `DomainPolicy`, so the library
-carries no hardcoded allowlist and can be reused across projects.
+bot-protected pages through a ladder of increasingly capable (and costly)
+fetcher tiers, behind a single stable port, with fail-closed SSRF guards. It
+is domain-agnostic by design -- the caller injects a `DomainPolicy`, so the
+library carries no hardcoded allowlist and can be reused across projects.
 
-> **Pre-release (`0.1.0a1`).** The public API is not frozen yet and may change
-> before the first stable release. Published to reserve the name and validate
-> the release pipeline. Not recommended for production use yet.
+> **Pre-release.** The public API is not frozen yet and may change before the
+> first stable release. Not recommended for production use yet.
 
 ## The problem it solves
 
-Fetching a page from a modern e-commerce or content site is rarely a plain HTTP
-GET anymore. Sites sit behind bot managers (Cloudflare, Akamai, DataDome,
+Fetching a page from a modern e-commerce or content site is rarely a plain
+HTTP GET anymore. Sites sit behind bot managers (Cloudflare, Akamai, DataDome,
 Kasada) that inspect TLS fingerprints, browser automation signals, and
-behavioural signatures. The same URL might return a clean `200` one minute and a
-challenge page or `429` the next.
+behavioural signatures. The same URL might return a clean `200` one minute and
+a challenge page or `429` the next.
 
-Handling this well means owning a messy escalation ladder: try a cheap HTTP call,
-fall back to TLS impersonation, then to a real (undetected) browser, and only as
-a last resort to a full undetected Chrome driver. Each rung is more capable but
-slower, heavier, and more expensive. Doing this inline, in every project that
-needs a page, spreads that complexity everywhere and makes it easy to leak
-requests to internal addresses (SSRF) or to confuse a transient block with a real
-result.
+Handling this well means owning several tools of varying cost and capability:
+a cheap HTTP call, a TLS impersonation layer, one or more real (undetected)
+browsers. Doing this inline, in every project that needs a page, spreads that
+complexity everywhere and makes it easy to leak requests to internal addresses
+(SSRF) or to confuse a transient block with a real result.
 
-`autolycos` packages that ladder once, correctly, behind a clean boundary.
+`autolycos` packages that set of tools once, correctly, behind a clean
+boundary.
 
 ## What it does
 
-It escalates through fetcher tiers by increasing cost, and stops at the first
-success:
+It exposes a ladder of fetcher tiers, ordered by increasing cost:
 
-1. `http` -- plain HTTP with a pinned IP (SSRF-safe). Cheapest, works on open sites.
-2. `tls` -- TLS fingerprint impersonation (`curl_cffi`). Beats TLS-signature filters.
-3. `browser` -- undetected headless browser (`patchright` + `playwright-stealth`).
-4. `uc` -- undetected Chrome driver (`seleniumbase`), for the hardest protectors.
+1. `http` -- plain HTTP with a pinned IP (SSRF-safe). Cheapest, works on open
+   sites.
+2. `tls` -- TLS fingerprint impersonation (`curl_cffi`). Beats TLS-signature
+   filters.
+3. `browser` -- undetected headless Chromium (`patchright` +
+   `playwright-stealth`).
+4. `uc` -- undetected Chrome driver (`seleniumbase`), **(deprecated)**, kept
+   for a re-evaluation should upstream progress on the one protector it was
+   built for.
+5. `camoufox` -- undetected headless Firefox (`camoufox`), an alternative
+   fingerprint to the Chromium-based tiers above.
 
-Your application asks a `Fetcher` for a URL and gets back a `FetchResult`. It
-never imports `patchright`, `curl_cffi`, or `seleniumbase`, and never learns
-which rung actually delivered the page.
+A caller asks the `Router` for a named tier and gets back a `Fetcher`; each
+call to `fetch(url)` returns a `FetchResult`. The router itself does not
+escalate or pick a tier for you: it resolves the name you give it to a
+concrete adapter, caching instances. Deciding WHICH tier to try, and whether
+to retry a different one on failure, is the caller's own policy -- `autolycos`
+gives you the tiers and the safety guarantees each one carries, not an
+opinion on when to use which. Your code never imports `patchright`,
+`curl_cffi`, `seleniumbase`, or `camoufox` directly, and never has to know
+which tool actually rendered the page.
 
 ## Why use it
 
 - **A stable port, not a pile of tools.** Your code depends on `Fetcher` /
-  `FetchResult`. Swapping, adding, or removing a tool is an adapter change, not a
-  rewrite of your call sites.
-- **Cost-aware escalation.** You only pay for the heavy tiers when the cheap ones
-  fail. Open sites stay fast; hard sites still get through.
+  `FetchResult` / `Router`. Swapping, adding, or removing a tool is an adapter
+  change, not a rewrite of your call sites.
 - **Fail-closed SSRF safety by construction.** A single shared predicate
-  (`check_scheme_and_domain`) guards both the config-mutation path and the fetch
-  path, so the two gates can never drift apart. Rejections raise `SSRFError`,
-  never a silent pass. Scheme allowlist closes `javascript:` / `file:` / internal
-  targets.
-- **Domain-agnostic and reusable.** No hardcoded site list. The caller injects a
-  `DomainPolicy`, so the same library serves a price monitor, a content archiver,
-  or any tool that needs resilient fetching.
-- **Policy separate from tools.** The `Router` (which tier to use) is a distinct
-  layer from the adapters (the tools themselves), so selection strategy evolves
-  independently of the fetchers.
+  (`check_scheme_and_domain`) guards the fetch path across every tier so
+  the checks can never drift apart between adapters. Rejections raise
+  `SSRFError`, never a silent pass. Scheme allowlist closes `javascript:` /
+  `file:` / internal targets. The `browser` and `camoufox` tiers additionally
+  route all traffic through a loopback egress proxy that pins the resolved
+  IP once and refuses any re-resolution; `uc` pins at the DNS layer instead,
+  through a Chromium host-resolver rule.
+- **Domain-agnostic and reusable.** No hardcoded site list. The caller injects
+  a `DomainPolicy`, so the same library serves a price monitor, a content
+  archiver, or any tool that needs resilient fetching.
+- **Policy separate from tools.** The `Router` (which tier a given fetch
+  uses) is a distinct layer from the adapters (the tools themselves), so tier
+  selection strategy evolves independently of the fetchers.
 
 ## Typical use cases
 
 - Daily price and availability monitoring of products on protected retailers.
 - Scraping or archiving pages behind Cloudflare / Akamai / DataDome.
-- Any backend that needs "get me this page, reliably, and tell me if you could
-  not" without embedding browser-automation plumbing.
+- Any backend that needs "get me this page, reliably, and tell me if you
+  could not" without embedding browser-automation plumbing.
 
 ## Stable contract (consumer-facing)
 
 - `autolycos.ports`: `Fetcher`, `FetchResult`, `Router`
 - `autolycos.safety`: `DomainPolicy`, `check_scheme_and_domain`
-- `autolycos.errors`: `SSRFError`, `FetchError`
-- `autolycos.router`: `StaticRouter`
+- `autolycos.errors`: `SSRFError`, `FetchError`, `UnknownFetcherError`
+- `autolycos.router`: `StaticRouter`, `known_tiers` (and `UnknownFetcherError`,
+  re-exported from `autolycos.errors`)
+- `autolycos.browser_gate`: `BrowserGate`
+- `autolycos.tiers`: the defaults of the browser-backed tiers (`BROWSER`,
+  `UC`, `CAMOUFOX`, instances of `BrowserBudget`, `UcBudget`,
+  `CamoufoxBudget`) and their budget checks, which report an out-of-order
+  setting as data (a `BudgetWarning`: `NavigationWarning` or `GateWarning`,
+  made of `BudgetTerm`s) for you to word. A term's `name` is always one of `TermName`, so terms can be looked
+  up by name: `launch_timeout_seconds`, `nav_timeout_seconds`,
+  `page_load_timeout_seconds`, `reconnect_time`, `render_wait`,
+  `kill_wait_seconds`, `orphan_sweep_delay_seconds`, `late_sweep_seconds`.
+  Plus the install probes an image build runs (`chromium_executable`,
+  `camoufox_ready`, `CAMOUFOX_BROWSER_VERSION`, `CAMOUFOX_EXECUTABLE_PATH`)
 
-Everything else (`adapters/*`, `challenge`, `egress_proxy`) is internal and
-reached only through a `Router` / `DomainPolicy` you construct.
+Everything else (`adapters/*`, `challenge`, `egress_proxy`) is internal: the
+tiers are reached through a `Router` and `DomainPolicy` you construct, and
+their defaults and install probes through `autolycos.tiers`.
 
 ## Install
 
 ```bash
 pip install autolycos                 # core (http tier)
 pip install "autolycos[tls]"          # + TLS impersonation
-pip install "autolycos[browser]"      # + undetected browser
+pip install "autolycos[browser]"      # + undetected Chromium
 pip install "autolycos[uc]"           # + undetected Chrome driver
+pip install "autolycos[camoufox]"     # + undetected Firefox
 ```
 
-Extras are additive: install only the tiers you actually need. The heavier
-browser and uc tiers pull in Chromium-class dependencies.
+Extras are additive: install only the tiers you actually need. None of the
+three heavier extras ships a working browser binary on `pip install` alone:
+`browser` needs `patchright install chromium` run once after install;
+`uc` needs a `seleniumbase`-managed `uc_driver` matching the installed
+Chromium's major version; `camoufox` never downloads a binary at fetch time
+by design (the adapter always passes an explicit path and version), so the
+matching Camoufox release must be provisioned separately before first use.
 
 ## Name
 
@@ -99,4 +129,4 @@ library wears the same trick: it changes its fingerprint to pass unnoticed.
 
 ## License
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/VOCSAP/autolycos/blob/main/LICENSE).

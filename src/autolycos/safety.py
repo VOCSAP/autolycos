@@ -12,6 +12,7 @@ this DNS lookup and the tool's own resolution (DNS-rebind).
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -19,6 +20,13 @@ from urllib.parse import urlsplit
 from .errors import FetchError, SSRFError
 
 ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+# RFC 3986 unreserved + reserved (gen-delims + sub-delims) + the percent
+# escape marker. An allowlist, not a denylist of "known-bad" characters
+# (quote, backslash, angle brackets, backtick, space, control bytes): closes
+# the injection at the shared choke point (check_scheme_and_domain, roadmap
+# c06082a5) against any byte outside RFC 3986, known or not yet enumerated.
+_RFC3986_SAFE_RE = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]*$")
 
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
@@ -53,7 +61,7 @@ class DomainPolicy:
     """Caller-injected navigation-domain allowlist.
 
     autolycos is a generic anti-bot toolkit: it must not hardcode which
-    domains are legitimate to navigate to. The caller (kerdoos) constructs
+    domains are legitimate to navigate to. The caller constructs
     this from its own site catalogue and passes it into every Fetcher and
     into `validate_target`. A host is allowed iff it equals one of
     `allowed_domains` or is a subdomain (leading-dot match prevents suffix
@@ -92,12 +100,14 @@ def check_scheme_and_domain(url: str, domain_policy: DomainPolicy) -> tuple[str,
     Shared choke-point predicate (FD2): the ONE place that decides whether a
     url's scheme/host are structurally acceptable. Used by both
     validate_target (fetch-time gate, below) and
-    kerdoos.registry.url_validation.validate_source_url (config-mutation
+    the consumer's write-path URL validator (config-mutation
     gate) so the two independent SSRF gates can never drift apart on this
     check (ADR 0001 SSRF requirement #4: one predicate, no allowlist drift).
 
     Returns (scheme, host) on success. Raises SSRFError on any rejection.
     """
+    if not _RFC3986_SAFE_RE.fullmatch(url):
+        raise SSRFError("url contains a character outside RFC 3986")
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
     if scheme not in ALLOWED_SCHEMES:
@@ -149,12 +159,13 @@ def resolve_and_pin(host: str, port: int) -> PinnedAddress:
 
     Unlike validate_target this takes an already-parsed host:port (a proxy
     CONNECT gives "host:port", not a URL) and does NOT apply the domain
-    allowlist: the proxy's job is the network-layer SSRF guard (ip_is_safe +
-    pin + loopback-only + port restriction), while the navigation-domain
-    allowlist stays with the browser layer (page.route / host-resolver
-    EXCLUDE), which must also permit render-critical CDN sub-resources the
-    DomainPolicy does not list. Raises SSRFError / FetchError like
-    validate_target.
+    allowlist itself: PinningProxy (ADR 0004 D4/C1) checks the CONNECT
+    authority's domain BEFORE ever calling this function, so a
+    non-allowlisted host is refused with zero resolution and never reaches
+    here at all. This function stays IP-layer-only by design (ip_is_safe +
+    pin), a second, independent line of defense against a host that IS
+    allowlisted but resolves to a non-global address (DNS rebind). Raises
+    SSRFError / FetchError like validate_target.
     """
     ip = _resolve_and_check(host, port)
     return PinnedAddress(host=host, port=port, ip=ip)
