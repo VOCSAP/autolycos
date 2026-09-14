@@ -1,0 +1,147 @@
+"""autolycos.challenge.looks_challenged: tightened markers, regression-locked.
+
+The shared heuristic drives the core retry loop for every tier, so it must NOT
+false-positive on healthy pages that legitimately embed Google reCAPTCHA v3 or
+Cloudflare's passive telemetry script, yet MUST still catch a real interstitial.
+Every committed HTML fixture (a real, healthy 200 page) is asserted non-challenged
+as a regression lock.
+"""
+
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+from autolycos.challenge import (
+    CHALLENGE_MARKERS,
+    looks_challenged,
+    looks_like_chrome_error_page,
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_HEALTHY_FIXTURES = (
+    "kabum_aw3225qf.html",
+    "amazon_b0cvqgsrz9.html",
+    "mercadolivre_mlb35045987.html",
+    "terabyte_40561.html",
+    # Pichau: Cloudflare-fronted but its only residual is the PASSIVE
+    # challenge-platform script (already excluded); no active marker survives.
+    "pichau_cv700b.html",
+    # Magalu RESOLVED (post-Akamai UC render): no challenge DOM, must be healthy.
+    "magalu_uc.html",
+    "magalu_bab5438g3h_camoufox.html",
+    "magalu_238968700_camoufox.html",
+)
+
+
+class HealthyFixturesNotChallengedTest(unittest.TestCase):
+    def test_every_real_page_is_not_challenged(self) -> None:
+        for name in _HEALTHY_FIXTURES:
+            html = (_FIXTURES / name).read_text(encoding="utf-8", errors="replace")
+            with self.subTest(fixture=name):
+                self.assertFalse(
+                    looks_challenged(200, html),
+                    f"{name} wrongly flagged challenged")
+
+
+class BroadMarkersRemovedTest(unittest.TestCase):
+    def test_bare_captcha_and_challenge_platform_are_gone(self) -> None:
+        # These matched reCAPTCHA v3 and Cloudflare's passive script on healthy
+        # pages; they must not be in the marker set anymore.
+        self.assertNotIn("captcha", CHALLENGE_MARKERS)
+        self.assertNotIn("challenge-platform", CHALLENGE_MARKERS)
+
+    def test_recaptcha_v3_only_page_is_not_challenged(self) -> None:
+        page = ('<html><head>'
+                '<style>.grecaptcha-badge{visibility:hidden}</style>'
+                '<script src="https://www.google.com/recaptcha/api.js?render=KEY">'
+                '</script></head><body>' + "content " * 400 + '</body></html>')
+        self.assertFalse(looks_challenged(200, page))
+
+    def test_cloudflare_passive_script_page_is_not_challenged(self) -> None:
+        page = ('<html><body>' + "content " * 400 +
+                '<script src="/cdn-cgi/challenge-platform/h/g/scripts/jsd/main.js">'
+                '</script></body></html>')
+        self.assertFalse(looks_challenged(200, page))
+
+
+class RealInterstitialStillChallengedTest(unittest.TestCase):
+    def test_cloudflare_just_a_moment(self) -> None:
+        self.assertTrue(looks_challenged(200, "<title>Just a moment...</title>"
+                                         + "x" * 5000))
+
+    def test_cloudflare_active_challenge_markers(self) -> None:
+        self.assertTrue(looks_challenged(
+            200, '<div class="cf-chl-widget"></div>' + "x" * 5000))
+        self.assertTrue(looks_challenged(
+            200, "window._cf_chl_opt={cvId:'3'}" + "x" * 5000))
+
+    def test_akamai_sec_cpt(self) -> None:
+        self.assertTrue(looks_challenged(
+            200, '<div id="sec-cpt-challenge"></div>' + "x" * 5000))
+
+    def test_real_akamai_bot_manager_page_is_challenged(self) -> None:
+        # The real Akamai challenge (Magalu, served at HTTP 200) must be flagged
+        # via its DOM markers (scf-akamai / sec-if-cpt-container), else the core
+        # retry loop never fires on a Magalu block.
+        akamai = (_FIXTURES / "magalu_cffi.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertTrue(looks_challenged(200, akamai))
+
+    def test_amazon_robot_check_validatecaptcha(self) -> None:
+        # Amazon's Robot Check anti-bot wall (served at HTTP 200) posts to
+        # /errors/validateCaptcha; it must be flagged so retry gets a chance.
+        page = ('<form method="get" action="/errors/validateCaptcha">'
+                '<h4>Type the characters you see in this image</h4></form>'
+                + "x" * 5000)
+        self.assertTrue(looks_challenged(200, page))
+
+    def test_perimeterx_and_datadome(self) -> None:
+        self.assertTrue(looks_challenged(200, "px-captcha " + "x" * 5000))
+        self.assertTrue(looks_challenged(200, "datadome " + "x" * 5000))
+
+    def test_ml_micro_landing_shell(self) -> None:
+        self.assertTrue(looks_challenged(
+            200, '<div class="micro-landing-container"></div>' + "x" * 5000))
+
+    def test_block_status_and_short_body(self) -> None:
+        self.assertTrue(looks_challenged(503, "x" * 5000))
+        self.assertTrue(looks_challenged(200, "tiny"))
+
+
+class ChromeErrorPageDetectionTest(unittest.TestCase):
+    """Card 1bddf3fa: Chrome's own internal error interstitial (a failed
+    navigation, not anti-bot content served BY a site) must be detected by
+    CONTENT, never by size -- the real interstitial is large (~188KB)."""
+
+    def test_error_code_marker_in_dom_is_detected(self) -> None:
+        page = (
+            '<html><body><script>window.errorData = '
+            '{"errorCode":"ERR_CONNECTION_REFUSED"};</script>'
+            + "x" * 200000 + "</body></html>")
+        self.assertTrue(looks_like_chrome_error_page(None, page))
+
+    def test_chrome_error_scheme_url_is_detected_even_without_marker(
+        self,
+    ) -> None:
+        self.assertTrue(
+            looks_like_chrome_error_page("chrome-error://chromewebdata/",
+                                          "<html></html>"))
+
+    def test_healthy_fixture_is_not_flagged(self) -> None:
+        html = (_FIXTURES / "kabum_aw3225qf.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertFalse(looks_like_chrome_error_page(
+            "https://www.kabum.com.br/produto/1", html))
+
+    def test_large_healthy_page_is_not_flagged_by_size_alone(self) -> None:
+        # A genuinely large page (larger than the real error interstitial)
+        # must never be flagged on size -- content is the only signal.
+        page = "<html><body>real content " * 20000 + "</body></html>"
+        self.assertGreater(len(page), 200000)
+        self.assertFalse(looks_like_chrome_error_page(
+            "https://example.com/", page))
+
+
+if __name__ == "__main__":
+    unittest.main()
